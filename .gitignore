@@ -1,0 +1,12 @@
+node_modules/
+.pnpm-store/
+*.log
+
+# verify/install-e2e.sh 的隔离 DSH_HOME 与 pnpm store 残留
+testhome/
+.dsh-e2e/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/

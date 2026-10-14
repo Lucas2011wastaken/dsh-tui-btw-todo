@@ -1,0 +1,42 @@
+{
+  "$schema": "https://dsh.community/schemas/dsh-plugin-0.15.json",
+  "id": "io.github.dsh-tui-ecosystem.btw-todo",
+  "name": "btw-todo",
+  "version": "0.1.0",
+  "manifestVersion": "0.15",
+  "facets": {
+    "host": {
+      "entry": "index.js",
+      "apiVersion": "v1alpha1"
+    }
+  },
+  "requires": {
+    "contracts": []
+  },
+  "permissions": [],
+  "contributes": {
+    "commands": [],
+    "x-tools": [
+      {
+        "name": "todo_append",
+        "surface": "session",
+        "registration": "ctx.tools.register",
+        "description": "Append todo items / mark existing items complete. Registered through the existing DSH tool service; also attached to /btw side-question requests by this plugin."
+      }
+    ],
+    "x-session-events": [
+      {
+        "type": "session/event",
+        "reason": "cache the last todo/write snapshot per session to derive append semantics"
+      }
+    ],
+    "x-llm-events": [
+      {
+        "type": "llm/stream",
+        "reason": "no TUI seam attaches tools to a /btw side question; the plugin builds its own tool-carrying request from the public waterfall"
+      }
+    ]
+  },
+  "subscriptions": [],
+  "license": "MIT"
+}

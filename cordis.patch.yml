@@ -1,0 +1,24 @@
+# dsh-tui-btw-todo bundle patch —— 把插件行挂进 profile 组合树。
+#
+# `/plugin install <spec>` 走宿主 ctx.pluginManager：pnpm 装包 → 因为本包
+# package.json 声明了 `dsh.bundle.patch`，CLI 的 reconcile 会把包名追加进
+# profile 的 dsh.profile.bundles；启动时 app-boot 按 bundle 顺序应用每个
+# patch 列表，下面这条 insert 就是真正挂载本插件的动作。
+#
+# 行配置全部走 index.js 里的 DEFAULTS。要调某个值，在 profile 自己的
+# cordis.patch.yml 用户层按 id 覆盖（不要再插一条同 id 的行）：
+#
+#   - id: btw-todo
+#     config:
+#       btwTool: true
+#       maxRounds: 3
+#       note: true
+#       seedFromLog: true
+#       toolTimeoutMs: 5000
+#       lang: auto          # auto | zh | en
+#       debug: false        # true = 经 ctx.logger.info 打激活/拦截诊断
+#       registerTool: true  # false = 只做 btw 桥，不全局注册工具
+#
+- insert:
+    - id: btw-todo
+      name: 'dsh-tui-btw-todo'

@@ -1,0 +1,55 @@
+{
+  "name": "dsh-tui-btw-todo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Expose a todo-updating tool inside the dsh-tui /btw side question (plugin-system probe)",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "cordis.patch.yml",
+    "dsh-plugin.json",
+    "README.md"
+  ],
+  "engines": {
+    "node": "^22.19 || >=24"
+  },
+  "scripts": {
+    "verify": "node verify/headless.mjs",
+    "verify:manifest": "node verify/run-manifest-check.mjs",
+    "verify:e2e": "bash verify/install-e2e.sh",
+    "verify:all": "npm run verify && npm run verify:manifest"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lucas2011wastaken/dsh-tui-btw-todo.git"
+  },
+  "homepage": "https://github.com/Lucas2011wastaken/dsh-tui-btw-todo#readme",
+  "bugs": {
+    "url": "https://github.com/Lucas2011wastaken/dsh-tui-btw-todo/issues"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  }
+}
