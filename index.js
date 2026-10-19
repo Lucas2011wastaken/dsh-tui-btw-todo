@@ -25,6 +25,11 @@
  * 纪律：零运行时依赖（不 import 任何 @deepseek-ai/* 包）、apply 里不 await、
  * per-session 状态随 `session/disposed` 清理、可选服务一律软探测降级。
  *
+ * 「当前列表」怎么读：本插件往 `ctx.sessionProjections` 注册一个自己的
+ * host-only 单元 `btw-todo.todos`（v0.2.0 起）。宿主在首次触达时按 `init`
+ * 折叠该 session 的既有日志，所以本行哪怕中途才激活也能拿到完整列表；弃用的
+ * 同步日志读法由宿主注册表承担（带迁移豁免），本插件不再自己调用。
+ *
  * @module dsh-tui-btw-todo
  */
 import { randomUUID } from 'node:crypto'
@@ -35,6 +40,10 @@ export const inject = ['tools']
 
 /** 贡献给模型的工具名。 */
 const TOOL_NAME = 'todo_append'
+/** 本插件自己的投影单元键（host-only，不进客户端快照）。 */
+const PROJECTION_KEY = 'btw-todo.todos'
+/** 折叠语义版本；改变 fold 语义时递增，让宿主的旧 checkpoint 行按版本作废。 */
+const PROJECTION_VERSION = 1
 const STATUSES = ['pending', 'in_progress', 'completed']
 /** btw 侧问被调用方标记的 source.kind（src/dsh-adapter/channel/session-metadata.ts）。 */
 const BTW_SOURCE_KIND = 'dsh-tui-btw'
@@ -54,8 +63,12 @@ const DEFAULTS = {
   note: true,
   /** 自定义说明文本；空 = 用内置文案。 */
   noteText: '',
-  /** 首次追加时允许用（已弃用的）同步日志读回填当前列表；读不到就退回投影/空表。 */
-  seedFromLog: true,
+  /**
+   * 首次追加时允许用（**已弃用**的）同步日志读回填当前列表（默认 false）。
+   * 默认关：宿主 `sessionProjections` 里的 `btw-todo.todos` 单元已经能回填
+   * 既有日志；这条弃用读法只留给没有投影服务的旧宿主。
+   */
+  seedFromLog: false,
   /** 单次工具执行的软超时（毫秒）。 */
   toolTimeoutMs: 5000,
   /** 文案语言：auto 跟随 DSH_TUI_LANG / 系统 locale，或固定 zh / en。 */
@@ -96,6 +109,30 @@ const OUTPUT_SCHEMA = {
         completed: { type: 'integer' },
       },
     },
+  },
+}
+
+// ── 投影单元的状态校验 ─────────────────────────────────────────────────
+/**
+ * `btw-todo.todos` 投影单元的 `stateSchema`。
+ *
+ * 宿主只在一处调用它：从**持久化 checkpoint** 还原状态时
+ * （`SessionProjectionRegistry.restore` → `def.stateSchema.parse(row.val)`，
+ * 注意这条路径不 catch，抛错会一路冒到会话恢复）。所以这里**永不抛错**：
+ * 逐项保留合法条目、丢弃其余，整行不是数组就降级为空表——按准入红线
+ * 「外部 JSON 一律校验，损坏时回退而不是崩溃」。注册本身只校验
+ * `stateVersion`，因此手写校验器足以守住零依赖，不需要引入 zod。
+ */
+const TODOS_STATE_SCHEMA = {
+  parse(value) {
+    if (!Array.isArray(value)) return []
+    const out = []
+    for (const item of value) {
+      if (item === null || typeof item !== 'object') continue
+      if (typeof item.content !== 'string' || !STATUSES.includes(item.status)) continue
+      out.push({ content: item.content, status: item.status })
+    }
+    return out
   },
 }
 
@@ -155,10 +192,15 @@ function normalizeConfig(config) {
 export function apply(ctx, config = {}) {
   const cfg = normalizeConfig(config)
   const copy = COPY[pickLang(cfg)]
-  const cache = new TodoListCache()
-  // 接缝一：会话事件。缓存最后一条 `todo/write`（整表快照），
-  // session/disposed 时随会话一起清理。
-  cache.observe(ctx)
+  const cache = new TodoListCache({ seedFromLog: cfg.seedFromLog })
+  // 接缝一：投影单元 + 会话事件。前者让宿主按 `init` 折叠既有日志回填，
+  // 后者在没有投影服务时兜底；session/disposed 时随会话一起清理。
+  const projected = cache.observe(ctx)
+  if (cfg.debug) {
+    info(ctx, projected
+      ? `projection ${PROJECTION_KEY} registered (backfills history through the host registry)`
+      : 'sessionProjections unavailable — falling back to the own event cache')
+  }
 
   const definition = todoToolDefinition(ctx, cfg, copy, cache)
   if (cfg.registerTool !== false) {
@@ -328,28 +370,45 @@ function countStatuses(todos) {
   return { pending, inProgress, completed }
 }
 
-// ── 当前 todo 列表（per-session 缓存 + 兜底回填）────────────────────────
+// ── 当前 todo 列表（插件自己的投影单元 + 兜底）──────────────────────────
 /**
  * `todo/write` 是整表快照，所以「当前列表」= 该 session 最后一条
- * `todo/write`。三种来源，按可靠性排序：
+ * `todo/write`。读取按可靠性排序：
  *
- *  1. 本插件对 `session/event` 的观察缓存（权威：从本行激活起的所有写入）；
- *  2. `ctx.sessionProjections.stateOf(session,'todos')`（官方读法；缺点见下）；
- *  3. 同步日志回填（`session.snapshotEvents()`，已被上游标记为「新调用禁止」
- *     的弃用读法，所以只在配置允许时试探一次，失败即放弃）。
+ *  1. **本插件注册的投影单元**（`btw-todo.todos`）：宿主
+ *     `sessionProjections` 在首次触达时按 `init` 折叠该 session 的既有内存
+ *     日志——注册得再晚也能回填；而且它不像官方 `todos` 单元那样在
+ *     `turn/start` 上清空。弃用的同步日志读法由**宿主注册表自己**承担并带
+ *     迁移豁免（`SessionProjectionRegistry.cellFor` 的 `no-deprecated`
+ *     注释），本插件不再调用它。
+ *  2. 本插件对 `session/event` 的观察缓存（宿主没有投影服务时兜底）。
+ *  3. 官方 `todos` 投影（会被 `turn/start` 清成 `null`，只作提示）。
+ *  4. `seedFromLog: true` 时才用的同步日志回填（**弃用读法**，默认关）。
  *
- * 为什么不能只靠 (2)：dsh-tool-todo 的投影在 `turn/start` 上会把状态清成
+ * 为什么不能只靠 (3)：dsh-tool-todo 的投影在 `turn/start` 上把状态清成
  * `null`（todos 属于「本轮计划」），而 TUI 的 todo 面板保留最后一次写入。
  * 只读投影会在跨轮时把旧列表吃掉——追加就变成了整表覆盖。
  */
 class TodoListCache {
-  constructor() {
+  constructor(options = {}) {
     /** @type {Map<string, Array<{content: string, status: string}>>} */
     this.bySession = new Map()
+    /** 注册成功的投影服务；缺席或注册失败时为 undefined（纯缓存模式）。 */
+    this.projections = undefined
+    /** 是否允许退回已弃用的同步日志读（默认关，见 DEFAULTS）。 */
+    this.seedFromLog = options.seedFromLog === true
   }
 
-  /** 由 apply 调用：订阅会话事件，并在 session/disposed 时清理（长会话内存有界）。 */
+  /**
+   * 由 apply 调用：先注册投影单元（软探测），再订阅会话事件兜底。
+   * 返回投影是否注册成功（`debug` 用）。
+   *
+   * 注册随本行 activation 的 fiber 归属：cordis 服务方法经 traceable proxy
+   * 把 `this.ctx` 解析成**调用方** context（与 `ctx.tools.register` 同款），
+   * 所以行卸载时 key 自动消失，不需要自己保管 disposer。
+   */
   observe(ctx) {
+    const projected = this.installProjection(ctx)
     ctx.on('session/event', (session, event) => {
       if (event?.type !== 'todo/write') return
       const todos = todoSnapshot(event.data)
@@ -358,30 +417,89 @@ class TodoListCache {
     ctx.on('session/disposed', (session) => {
       if (session?.id !== undefined) this.bySession.delete(String(session.id))
     })
+    return projected
+  }
+
+  /**
+   * 注册 `btw-todo.todos`（host-only：不给 `wire`，不进客户端快照）。
+   * 服务缺席、方法缺失或键已被别的 stateVersion 占用时静默降级。
+   */
+  installProjection(ctx) {
+    let service
+    try {
+      service = ctx.get?.('sessionProjections', false)
+    } catch {
+      return false
+    }
+    if (service === undefined || typeof service.register !== 'function') return false
+    try {
+      service.register({
+        key: PROJECTION_KEY,
+        stateSchema: TODOS_STATE_SCHEMA,
+        // 空日志 = 空表（而不是官方 todos 单元的 null）。
+        init: () => [],
+        apply: foldTodoWrite,
+        stateVersion: PROJECTION_VERSION,
+      })
+      this.projections = service
+      return true
+    } catch {
+      // 键冲突 / 服务正在回收：保持纯缓存模式。
+      this.projections = undefined
+      return false
+    }
   }
 
   set(sessionId, todos) {
     this.bySession.set(String(sessionId), todos.map(todo => ({ content: todo.content, status: todo.status })))
   }
 
+  /** 读本插件自己的投影单元；未注册、键缺失或状态非法时返回 undefined。 */
+  readOwn(session) {
+    if (this.projections === undefined) return undefined
+    try {
+      return todoSnapshot({ todos: this.projections.stateOf(session, PROJECTION_KEY) })
+    } catch {
+      return undefined
+    }
+  }
+
   read(ctx, session) {
     const id = String(session.id)
+    // 1. 自己的投影单元：完整历史 + 不被 turn/start 清空，且是宿主负责弃用读。
+    //    `stateOf` 返回的是宿主投影里的活引用，`todoSnapshot` 已把它复制成新表，
+    //    调用方可以放心 map/追加，不会改到注册表的状态。
+    const own = this.readOwn(session)
+    if (own !== undefined) return own
+
+    // 2. 本行激活以来的事件缓存。
     const cached = this.bySession.get(id)
     if (cached !== undefined) return cached
 
+    // 3. 官方 todos 投影（可能已被 turn/start 清成 null）。
     const projected = readProjection(ctx, session)
     if (projected !== undefined) {
       this.set(id, projected)
       return this.bySession.get(id)
     }
 
-    const seeded = readLogTail(session)
-    if (seeded !== undefined) {
-      this.set(id, seeded)
-      return this.bySession.get(id)
+    // 4. 显式开启时才退回弃用的同步日志读。
+    if (this.seedFromLog) {
+      const seeded = readLogTail(session)
+      if (seeded !== undefined) {
+        this.set(id, seeded)
+        return this.bySession.get(id)
+      }
     }
     return []
   }
+}
+
+/** 投影单元的纯折叠：只认 `todo/write`，其余事件返回同一个 state 引用。 */
+function foldTodoWrite(state, event) {
+  if (event?.type !== 'todo/write') return state
+  const todos = todoSnapshot(event.data)
+  return todos === undefined ? state : todos
 }
 
 function todoSnapshot(data) {
@@ -408,6 +526,11 @@ function readProjection(ctx, session) {
   }
 }
 
+/**
+ * 弃用兜底：同步日志读（`snapshotEvents()`，上游标注「新调用禁止」）。
+ * 只在 `seedFromLog: true` 且宿主没有投影服务时才会走到这里；读不到就放弃，
+ * 让调用方退回空表。
+ */
 function readLogTail(session) {
   try {
     if (typeof session.snapshotEvents !== 'function') return undefined

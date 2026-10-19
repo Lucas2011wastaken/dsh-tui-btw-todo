@@ -1,6 +1,6 @@
 {
   "name": "dsh-tui-btw-todo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Expose a todo-updating tool inside the dsh-tui /btw side question (plugin-system probe)",
   "type": "module",

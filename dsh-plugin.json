@@ -2,7 +2,7 @@
   "$schema": "https://dsh.community/schemas/dsh-plugin-0.15.json",
   "id": "io.github.dsh-tui-ecosystem.btw-todo",
   "name": "btw-todo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "manifestVersion": "0.15",
   "facets": {
     "host": {
@@ -27,13 +27,21 @@
     "x-session-events": [
       {
         "type": "session/event",
-        "reason": "cache the last todo/write snapshot per session to derive append semantics"
+        "reason": "fallback cache when sessionProjections is absent; the projection unit is the primary read"
       }
     ],
     "x-llm-events": [
       {
         "type": "llm/stream",
         "reason": "no TUI seam attaches tools to a /btw side question; the plugin builds its own tool-carrying request from the public waterfall"
+      }
+    ],
+    "x-projections": [
+      {
+        "key": "btw-todo.todos",
+        "stateVersion": 1,
+        "wire": "none (host-only, not in client snapshots)",
+        "reason": "host-only projection unit: fold todo/write over the whole session log so an activation that starts late still reads the full list, and so turn/start never clears it"
       }
     ]
   },

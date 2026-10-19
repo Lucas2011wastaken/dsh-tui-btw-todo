@@ -10,8 +10,9 @@
  *    的 `ctx.waterfall(this, 'llm/stream', options, next)`）。
  *
  * 只有三处是桩，且都按真实实现的形状写：`systemPrompt`（ToolRuntime 的静态
- * inject 需要）、`llm`（脚本化模型，记录每一次它真正看到的请求）、`agents` /
- * `sessionProjections`（本插件唯一的两个软探测读法）。
+ * inject 需要）、`llm`（脚本化模型，记录每一次它真正看到的请求）、`agents`
+ * （本插件唯一的软探测读法）。`sessionProjections` 默认是桩，[13]/[14] 换成
+ * 真实的 `SessionProjectionRegistry`。
  *
  * 断言的核心事实：
  *  1. `/btw` 请求被识别 → 插件另建带 `todo_append` 的请求；**调用方的 options
@@ -30,6 +31,8 @@ import { importFromRepo } from './dsh-repo.js'
 // cordis 与 dsh-tools 从 dsh-TUI 检出里取（它们不是公开 npm 包）；见 dsh-repo.js。
 const { Context, Service } = await importFromRepo('@deepseek-ai/cordis')
 const { ToolRuntime } = await importFromRepo('@deepseek-ai/dsh-tools')
+// 真实投影注册表：验「本插件自己的单元」能回填历史、且不被 turn/start 清空。
+const { SessionProjectionRegistry } = await importFromRepo('@deepseek-ai/dsh-session-projection')
 
 process.env.DSH_TUI_LANG = 'zh'
 
@@ -132,16 +135,26 @@ function textOfChunks(list) {
 }
 
 // ── 最小组合 ────────────────────────────────────────────────────────────
-async function compose({ pluginConfig = {}, sessions = new Map() } = {}) {
+async function compose({ pluginConfig = {}, sessions = new Map(), realProjections = false } = {}) {
   const root = new Context()
   await root.plugin(StubSystemPrompt).await()
   await root.plugin(ToolRuntime).await()
   const llm = await root.plugin(ScriptedLlm).await().then(fiber => fiber.ctx.get('llm'))
-  const projections = await root.plugin(StubProjections).await().then(fiber => fiber.ctx.get('sessionProjections'))
+  let projections
+  let projectionCtx
+  if (realProjections) {
+    // 真实注册表的 `session/event` 监听挂在它自己的 ctx 上；测试要把事件发到
+    // 同一个 ctx（真实宿主里事件从 session 作用域一路向上冒泡）。
+    const fiber = await root.plugin(SessionProjectionRegistry).await()
+    projectionCtx = fiber.ctx
+    projections = projectionCtx.get('sessionProjections')
+  } else {
+    projections = await root.plugin(StubProjections).await().then(fiber => fiber.ctx.get('sessionProjections'))
+  }
   await root.plugin(StubAgents, sessions).await()
   const fiber = root.plugin(plugin, pluginConfig)
   await fiber.await()
-  return { root, fiber, llm, projections }
+  return { root, fiber, llm, projections, projectionCtx }
 }
 
 function makeSession(id) {
@@ -153,6 +166,37 @@ function makeSession(id) {
       return { seq: this.events.length, type, data }
     },
   }
+}
+
+/**
+ * 真实投影注册表能折叠的「活」session：`seq` = 日志下标、可切片快照、按 seq
+ * 取事件。`hostCtx` 在 compose 之后接上（事件要发到注册表监听的那个 ctx）。
+ */
+function makeLiveSession(id) {
+  const events = []
+  const session = {
+    id,
+    header: {},
+    inheritedEventCount: 0,
+    events,
+    hostCtx: undefined,
+    get seq() {
+      return events.length
+    },
+    snapshotEvents(fromSeq, toSeqExclusive) {
+      return events.slice(fromSeq ?? 0, toSeqExclusive ?? events.length)
+    },
+    eventAt(seq) {
+      return events[seq]
+    },
+    append(type, data) {
+      const event = { seq: events.length, type, data }
+      events.push(event)
+      session.hostCtx?.emit('session/event', session, event)
+      return event
+    },
+  }
+  return session
 }
 
 function btwOptions(sessionId, question) {
@@ -311,7 +355,7 @@ console.log('[7] 追加语义：去重 + 完成匹配 + 未匹配上报（走真
   await root.stop?.()
 }
 
-console.log('[8] 跨轮兜底：投影被 turn/start 清空时，用日志尾回填而不是覆盖')
+console.log('[8] 默认不读弃用日志：seedFromLog 默认 false，一次 snapshotEvents 都不调')
 {
   const session = makeSession('s-4')
   const older = [
@@ -319,18 +363,53 @@ console.log('[8] 跨轮兜底：投影被 turn/start 清空时，用日志尾回
     { type: 'todo/write', data: { todos: [{ content: '旧任务', status: 'pending' }] } },
     { type: 'turn/start', data: {} },
   ]
-  session.snapshotEvents = () => older
+  let logReads = 0
+  session.snapshotEvents = () => {
+    logReads += 1
+    return older
+  }
   const { root, fiber, projections } = await compose({ sessions: new Map([[session.id, session]]) })
-  projections.bySession.set(session.id, null) // 投影已清空
+  projections.bySession.set(session.id, null) // 官方投影已被 turn/start 清空
   const result = await root.tools.execute({
     callId: 'c4', name: 'todo_append', arguments: { add: ['新任务'] }, agent: { session },
     signal: new AbortController().signal,
   })
+  assert.equal(logReads, 0, 'the deprecated synchronous log read must not be called by default')
+  assert.deepEqual(result.value.todos, [{ content: '新任务', status: 'pending' }],
+    'without a projection service the list starts empty (documented trade-off)')
+  console.log('    ok — 默认不碰 session.snapshotEvents（弃用读法关闭）')
+  await fiber.dispose()
+  await root.stop?.()
+}
+
+console.log('[8b] 显式 seedFromLog:true：旧兜底仍可用（留给没有投影服务的宿主）')
+{
+  const session = makeSession('s-4b')
+  const older = [
+    { type: 'turn/start', data: {} },
+    { type: 'todo/write', data: { todos: [{ content: '旧任务', status: 'pending' }] } },
+    { type: 'turn/start', data: {} },
+  ]
+  let logReads = 0
+  session.snapshotEvents = () => {
+    logReads += 1
+    return older
+  }
+  const { root, fiber, projections } = await compose({
+    pluginConfig: { seedFromLog: true },
+    sessions: new Map([[session.id, session]]),
+  })
+  projections.bySession.set(session.id, null)
+  const result = await root.tools.execute({
+    callId: 'c4b', name: 'todo_append', arguments: { add: ['新任务'] }, agent: { session },
+    signal: new AbortController().signal,
+  })
+  assert.equal(logReads, 1, 'the opt-in deprecated read runs exactly once')
   assert.deepEqual(result.value.todos, [
     { content: '旧任务', status: 'pending' },
     { content: '新任务', status: 'pending' },
   ])
-  console.log('    ok — 旧列表没被吃掉（seedFromLog 回填）')
+  console.log('    ok — 开启后旧列表没被吃掉')
   await fiber.dispose()
   await root.stop?.()
 }
@@ -420,6 +499,94 @@ console.log('[12] 插件路径早期失败：退回原生侧问请求（不让�
   assert.equal(session.events.length, 0)
   console.log('    ok — 插件自己挂掉时 btw 表现与未安装时一致')
   await fiber.dispose()
+  await root.stop?.()
+}
+
+console.log('[13] 自有投影单元（真实 SessionProjectionRegistry）：注册晚也回填，turn/start 不清空')
+{
+  const session = makeLiveSession('s-9')
+  // 插件激活**之前**就写过的历史：一轮开始 → 写下旧列表 → 下一轮开始。
+  session.append('turn/start', {})
+  session.append('todo/write', { todos: [{ content: '旧任务', status: 'pending' }] })
+  session.append('turn/start', {})
+  const { root, fiber, projections, projectionCtx } = await compose({
+    sessions: new Map([[session.id, session]]),
+    realProjections: true,
+  })
+  session.hostCtx = projectionCtx
+
+  // 对照组：照 dsh-tool-todo 的语义注册官方键（turn/start 归 null）。
+  await root.plugin((ctx) => {
+    const service = ctx.get('sessionProjections')
+    service.register({
+      key: 'todos',
+      stateSchema: { parse: value => value },
+      init: () => null,
+      apply: (state, event) => event.type === 'todo/write'
+        ? event.data.todos
+        : event.type === 'turn/start' ? null : state,
+      stateVersion: 2,
+    })
+  }).await()
+
+  assert.equal(projections.stateOf(session, 'todos'), null, 'the official-style unit is cleared by turn/start')
+  assert.deepEqual(projections.stateOf(session, 'btw-todo.todos'),
+    [{ content: '旧任务', status: 'pending' }], 'the plugin unit folded the pre-activation log')
+
+  const result = await root.tools.execute({
+    callId: 'c13', name: 'todo_append', arguments: { add: ['新任务'] }, agent: { session },
+    signal: new AbortController().signal,
+  })
+  assert.deepEqual(result.value.todos, [
+    { content: '旧任务', status: 'pending' },
+    { content: '新任务', status: 'pending' },
+  ], 'append kept the pre-activation list instead of overwriting it')
+  assert.deepEqual(projections.stateOf(session, 'btw-todo.todos').map(todo => todo.content),
+    ['旧任务', '新任务'], 'the unit advanced with the write')
+
+  // 手写 stateSchema 走真实的持久化还原路径。宿主 `restore` 不 catch，
+  // 所以校验器永不抛错：好行原样还原，坏行降级为空表 / 只留合法条目。
+  const checkpoint = projections.checkpoint(session)
+  assert.equal(checkpoint['btw-todo.todos'].ver, 1, 'checkpoint row carries the unit stateVersion')
+  const restored = projections.restore(checkpoint, session.snapshotEvents(), 0, session.header, 0)
+  assert.deepEqual(restored.checkpoint['btw-todo.todos'].val.map(todo => todo.content),
+    ['旧任务', '新任务'], 'a valid checkpoint row restores through the hand-written parse()')
+  const corrupted = {
+    ...checkpoint,
+    'btw-todo.todos': { ...checkpoint['btw-todo.todos'], val: [{ content: 42, status: 'pending' }] },
+  }
+  const salvaged = projections.restore(corrupted, session.snapshotEvents(), 0, session.header, 0)
+  assert.deepEqual(salvaged.checkpoint['btw-todo.todos'].val, [],
+    'a corrupt row degrades to an empty list instead of failing the session restore')
+  const partly = {
+    ...checkpoint,
+    'btw-todo.todos': {
+      ...checkpoint['btw-todo.todos'],
+      val: [{ content: '旧任务', status: 'pending' }, { content: '坏条目', status: 'nonsense' }],
+    },
+  }
+  const kept = projections.restore(partly, session.snapshotEvents(), 0, session.header, 0)
+  assert.deepEqual(kept.checkpoint['btw-todo.todos'].val, [{ content: '旧任务', status: 'pending' }],
+    'valid entries survive a partially corrupt row')
+
+  console.log('    ok — 回填 + 追加都对；官方 todos 单元同时刻是 null；checkpoint 还原与坏行降级都正常')
+  await fiber.dispose()
+  await root.stop?.()
+}
+
+console.log('[14] 卸载：自有投影单元随本行 fiber 一并注销')
+{
+  const session = makeLiveSession('s-10')
+  const { root, fiber, projections, projectionCtx } = await compose({
+    sessions: new Map([[session.id, session]]),
+    realProjections: true,
+  })
+  session.hostCtx = projectionCtx
+  assert.deepEqual(projections.stateOf(session, 'btw-todo.todos'), [], 'registered while the row is active')
+  await fiber.dispose()
+  assert.equal(projections.stateOf(session, 'btw-todo.todos'), undefined,
+    'the registration must ride the plugin fiber')
+  console.log('    ok — 行卸载后 key 从宿主注册表消失，没有残留状态')
   await root.stop?.()
 }
 

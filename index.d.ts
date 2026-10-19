@@ -25,7 +25,13 @@ export interface Config {
   note?: boolean
   /** 自定义说明文本；空 = 内置文案（默认 ''）。 */
   noteText?: string
-  /** 首次追加允许用（已弃用的）同步日志读回填当前列表（默认 true）。 */
+  /**
+   * 允许用（**已弃用**的）`session.snapshotEvents()` 回填当前列表（默认 false）。
+   *
+   * 默认关：本插件向 `ctx.sessionProjections` 注册自己的 host-only 单元
+   * `btw-todo.todos`，宿主会在首次触达时按 `init` 折叠既有日志，因此不需要
+   * 自己调用弃用读法。这条只留给没有投影服务的旧宿主。
+   */
   seedFromLog?: boolean
   /** 单次工具执行的软超时，毫秒（默认 5000）。 */
   toolTimeoutMs?: number

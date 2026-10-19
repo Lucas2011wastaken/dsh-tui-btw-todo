@@ -14,7 +14,7 @@ btw 侧问里塞一个工具）在现有接缝里**没有对应接口**，所以
 | 注册模型可见工具 `todo_append` | `ctx.tools.register()`（**既有工具服务**） | 合规：红线要求模型可见面只走既有服务（工具 / prompt 段 / preset） |
 | 把工具带进 `/btw` 请求 | `llm/stream` 瀑布事件（dsh-llm 公开扩展点）+ 插件自建请求 | **绕过**：TUI 十四道接缝里没有「给某次辅助调用附加工具」的接口 |
 | 更新 todo 列表 | `session.append('todo/write', { todos })` | 合规：接缝一（会话事件），TUI 的 todo 面板直接消费 |
-| 观察「当前列表」 | `session/event`（缓存最后一条 `todo/write`）+ `ctx.sessionProjections.stateOf` | 合规：接缝一 + 既有投影服务 |
+| 观察「当前列表」 | 自注册投影单元 `btw-todo.todos`（`ctx.sessionProjections.register`）+ `session/event` 兜底缓存 | 合规：既有投影服务；弃用的日志读法由宿主注册表承担 |
 
 一句话流程：
 
@@ -30,6 +30,33 @@ btw 侧问里塞一个工具）在现有接缝里**没有对应接口**，所以
 **调用方的请求对象一字未动**：插件的请求是新建对象（`llm/stream` 的
 `options` 属于调用方，dsh-llm 明确要求「callers own their request inputs and
 must keep them unchanged」）。
+
+## v0.2.0：把「当前列表」交给宿主投影
+
+0.1.0 的读取顺序是：自己的事件缓存 → 官方 `todos` 投影 → 弃用的
+`session.snapshotEvents()`。0.2.0 换成：
+
+1. 插件自注册的 **host-only 投影单元** `btw-todo.todos`（主路径）；
+2. `session/event` 缓存（宿主没有投影服务时兜底）；
+3. 官方 `todos` 投影（可能已被 `turn/start` 清空，只作提示）；
+4. `seedFromLog: true` 时才用的弃用读法（默认关）。
+
+为什么这样更稳：
+
+- **能回填**：宿主对「注册得晚 / 会话比注册表老」的单元会按 `init` 折叠内存
+  日志，所以插件中途激活也能拿到激活前的列表；
+- **不清空**：折叠只认 `todo/write`，其余事件返回同一个 state 引用
+  （`turn/start` 不再把列表抹掉）；
+- **零依赖保住**：单元的 `stateSchema` 只在还原持久化 checkpoint 时被调用
+  （`restore` → `.parse`，这条路径不 catch，抛错会冒到会话恢复），所以本包手写
+  了一个**永不抛错**的校验器：合法条目保留、坏条目丢弃、整行不是数组就降级为
+  空表（准入红线「外部 JSON 一律校验，损坏时回退而不是崩溃」），没有引入 zod；
+- **不留残骸**：服务方法经 cordis 的 traceable proxy 把 `this.ctx` 解析成
+  **调用方** context，所以注册随本行 fiber 卸载（第 14 组断言）。
+
+配置兼容：`seedFromLog` 默认由 `true` 改为 `false`；老 profile 里显式写
+`seedFromLog: true` 的行为不变。单元键与版本写在 `dsh-plugin.json` 的
+`contributes["x-projections"]` 里（同样只是声明，见「已知缺口」）。
 
 ## 安装（`/plugin install`）
 
@@ -85,7 +112,7 @@ must keep them unchanged」）。
 | `btwTool` | `true` | 是否在 `/btw` 请求里带上工具 |
 | `maxRounds` | `3` | 一次 btw 请求最多几轮（≥2 才可能「工具轮 + 回答轮」） |
 | `note` / `noteText` | `true` / `''` | 是否附工具说明（侧问契约写着「没有工具」，需要说明例外） |
-| `seedFromLog` | `true` | 首次追加时允许用同步日志读回填当前列表（见「已知取舍」） |
+| `seedFromLog` | `false` | 是否允许用**已弃用**的 `session.snapshotEvents()` 回填（默认关，见「已知取舍」） |
 | `toolTimeoutMs` | `5000` | 单次工具执行软超时 |
 | `lang` | `auto` | `auto` / `zh` / `en` |
 | `debug` | `false` | `true` 时经 `ctx.logger.info` + stderr 打一行激活/拦截诊断 |
@@ -100,16 +127,17 @@ must keep them unchanged」）。
 ```sh
 export DSH_TUI_REPO=/path/to/dsh-TUI   # 检出不在默认位置时才需要
 
-npm run verify            # 无头：真实 cordis + 真实 ToolRuntime，12 组断言
+npm run verify            # 无头：真实 cordis + 真实 ToolRuntime + 真实投影注册表，15 组断言
 npm run verify:manifest   # 用 dsh-TUI 检出里的真实准入代码校验 dsh-plugin.json
 npm run verify:e2e        # 隔离 DSH_HOME 里的真实装链路 + 启动激活取证（不碰 ~/.dsh）
 npm run verify:all        # 前两项
 ```
 
 `verify/headless.mjs` 跑在一个**最小但真实**的组合上（真 cordis `Context`/`Service`、
-真 `@deepseek-ai/dsh-tools` 的 `ToolRuntime`、照抄 `LlmRuntime` 的
+真 `@deepseek-ai/dsh-tools` 的 `ToolRuntime`、真 `@deepseek-ai/dsh-session-projection`
+的 `SessionProjectionRegistry`、照抄 `LlmRuntime` 的
 `ctx.waterfall(this,'llm/stream',options,next)` 分派方式；只有 `systemPrompt`/`llm`/
-`agents`/`sessionProjections` 是桩），断言：
+`agents` 是桩），断言：
 
 1. `inject: ['tools']` 生效，注册表里只有 `todo_append`，apply 未 await；
 2. btw 请求被识别 → 插件另建带工具的请求，**原 options 逐字节不变**（含断言
@@ -119,7 +147,9 @@ npm run verify:all        # 前两项
 5. 行卸载后工具从注册表消失；
 6. 非 btw 请求原样放行（同一个对象、无 tools、无 note）；
 7. 追加语义：去重、按子串完成、未匹配如实上报、无变化不写；
-8. 跨轮兜底：投影被 `turn/start` 清空时用日志尾回填，旧列表不被吃掉；
+8. **默认不读弃用日志**：`seedFromLog: false` 时 `session.snapshotEvents()`
+   一次都不调用（计数断言），没有投影服务的宿主从空表起步；
+   8b. 显式 `seedFromLog: true` 时旧兜底仍可用（只调用一次）；
 9. `btwTool: false` 时只注册全局工具、没有桥；
 10. btw 里模型不用工具时与原生侧问等价（只多一次 `tools` 字段）；
 11. delta-only 协议（只有 `tool-call-delta`）下工具调用同样被识别执行；
@@ -127,6 +157,11 @@ npm run verify:all        # 前两项
     ——这一条真的抓到过一个 bug：监听器的 catch-all 把下游适配器的报错也吞了，
     然后补一次 `next()`，等于同一次模型请求发两遍（重复计费）。修法是把
     `next()` 挪出 try；回归断言留在第 12 组。
+13. **自有投影单元**（真实 `SessionProjectionRegistry`）：插件注册得比历史晚
+    也能折叠既有日志回填，追加不覆盖旧列表；同一时刻官方语义的 `todos` 单元
+    已被 `turn/start` 清成 `null`（这正是不能用它的原因）；`checkpoint()` →
+    `restore()` 走一遍，好行原样还原，坏行按「保留合法条目 / 降级空表」处理；
+14. 行卸载后自有投影单元的 key 从宿主注册表消失（注册归属本行 fiber）。
 
 `verify/manifest-check.ts` 用 `@dsh-std/manifest` 的官方 parser +
 仓内 `validatePlugin` / `negotiate`：本包 manifest 判为 `compatible`。
@@ -137,7 +172,7 @@ npm run verify:all        # 前两项
 
 ```
 $ dsh plugin --profile probe add "$PKG"
-+ dsh-tui-btw-todo 0.1.0 <- ../../../btw-todo          # pnpm 以 link: 装本地目录
++ dsh-tui-btw-todo 0.2.0 <- ../../../btw-todo          # pnpm 以 link: 装本地目录
 [WARN] … peerDependencies … will not resolve … (本包零运行时 import，无影响)
 
 $ cat profiles/probe/package.json
@@ -167,7 +202,7 @@ dsh: AUTH: Authentication Fails …
   （`contributes` 只认 `commands`，另有 `^x-` 扩展位）。本包把工具贡献写在
   `contributes["x-tools"]` 里——schema 接受、`validatePlugin` 通过，但官方
   `projectManifest` 投影只保留身份 + facet，`contributes` 整段不进入投影，
-  协商也看不到它。于是协商给出 `compatible`：**声明了零契约的插件也是
+  协商也看不到它（`x-projections` 的投影单元声明同理）。于是协商给出 `compatible`：**声明了零契约的插件也是
   compatible**，这个结论对本插件是空洞的（它真正的贡献无法被判定）。
 - **`/btw` 是设计上无工具的**（`sideQuestion.ts`：no `tools` field, ever；
   prompt 里写着 "No tools are available here"），十四道接缝没有一道能改这次
@@ -180,10 +215,13 @@ dsh: AUTH: Authentication Fails …
   但换成任意插件，这就是一个「能看全量上下文」的口子。
 - **`todo/write` 的投影语义与面板语义不一致**：dsh-tool-todo 的 `todos` 投影在
   `turn/start` 上清成 `null`（「本轮计划」语义），而 TUI 的 todo 面板保留最后
-  一次写入。插件要「追加」就只能在 `session/event` 上自己缓存整表；跨轮且缓存
-  为空时退回到（上游已标记「新调用禁止」的）`session.snapshotEvents()` 回填。
-  这是本插件最脏的一处取舍，`seedFromLog: false` 可关掉（代价：跨轮首次追加
-  可能从空表开始）。
+  一次写入。只读官方投影会在跨轮时把旧列表吃掉——追加就变成整表覆盖。
+  v0.2.0 的解法是**自己注册一个 host-only 投影单元** `btw-todo.todos`：宿主
+  `SessionProjectionRegistry` 在首次触达时按 `init` 折叠该 session 的既有日志
+  （注册得再晚也能回填），而且它不被 `turn/start` 清空。于是插件不再自己调用
+  已弃用的 `session.snapshotEvents()`——**那条调用改由宿主注册表承担**，它自己
+  带着迁移豁免（`cellFor` 里的 `no-deprecated` 注释），宿主迁移后本插件自动
+  跟着干净。`seedFromLog` 因此默认改为 `false`，只留给没有投影服务的旧宿主。
 - **`Config` schemastery 面缺席**：合规写法是 `export const Config =
   Schema.object({...})`，但那要 import `@deepseek-ai/schemastery`。本包选择
   **零运行时依赖**（不 import 任何 `@deepseek-ai/*`），所以按指南允许的另一条路

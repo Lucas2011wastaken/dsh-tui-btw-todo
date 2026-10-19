@@ -13,7 +13,7 @@
 #       btwTool: true
 #       maxRounds: 3
 #       note: true
-#       seedFromLog: true
+#       seedFromLog: false  # true = 允许退回(已弃用的) snapshotEvents 回填（默认关）
 #       toolTimeoutMs: 5000
 #       lang: auto          # auto | zh | en
 #       debug: false        # true = 经 ctx.logger.info 打激活/拦截诊断
